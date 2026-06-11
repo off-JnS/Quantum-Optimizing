@@ -4,8 +4,14 @@ __pycache__/
 .venv/
 venv/
 
+# Secrets — NEVER commit these
+.env
+
 # Streamlit
 .streamlit/secrets.toml
+
+# Docker
+.dockerignore
 
 # OS
 .DS_Store

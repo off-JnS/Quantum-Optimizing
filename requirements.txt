@@ -2,17 +2,21 @@
 #   * qiskit-optimization 0.7.0 vendors QAOA / COBYLA / NumPyMinimumEigensolver
 #     (qiskit-algorithms is no longer needed for the solver pipeline)
 #   * qiskit-finance 0.4.1 only uses qiskit_optimization APIs, so it runs fine on Qiskit 2.x
-#   * qiskit-aer 0.17.x is the Qiskit 2.x compatibility line (local simulator, no IBM account)
+#   * qiskit-aer 0.17.x is the Qiskit 2.x compatibility line (local simulator)
+#   * qiskit-ibm-runtime 0.34+ supports Qiskit 2.x for real IBM hardware (optional)
 qiskit==2.4.1
 qiskit-aer==0.17.2
 qiskit-optimization==0.7.0
 qiskit-finance==0.4.1
 qiskit-algorithms==0.4.0    # transitive requirement of qiskit-finance; 0.4.0 is the Qiskit-2.x-compatible release
+qiskit-ibm-runtime>=0.34.0  # IBM Quantum hardware backend (optional — only needed when IBM_QUANTUM_TOKEN is set)
 
-# Data / app stack — newest versions that still support Python 3.10 on Windows and macOS
-streamlit==1.58.0
+# Data / ML stack
+scikit-learn>=1.5.0          # K-Means clustering for 500-stock hierarchical mode
+streamlit==1.45.1
 yfinance==1.4.1
 plotly==6.8.0
 pandas==2.3.3
 numpy==2.2.6
 scipy==1.15.3
+python-dotenv>=1.0.0         # loads .env file automatically (optional but recommended)

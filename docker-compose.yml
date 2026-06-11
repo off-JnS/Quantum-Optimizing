@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  quantum-optimizer:
+    build: .
+    image: quantum-optimizer:latest
+    container_name: quantum-optimizer
+    restart: unless-stopped      # keeps the app running 24/7
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env                     # create from .env.example and fill in your values
+    environment:
+      STREAMLIT_SERVER_HEADLESS: "true"
+    volumes:
+      - streamlit_cache:/root/.streamlit   # persists Streamlit's data cache
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  streamlit_cache:
