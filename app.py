@@ -855,7 +855,7 @@ def render_results(res: dict) -> None:
         }
         if res.get("clustered"):
             col_cfg["Cluster"] = st.column_config.NumberColumn("Cluster #")
-        st.dataframe(table, hide_index=True, width="stretch", column_config=col_cfg)
+        st.dataframe(table, hide_index=True, use_container_width=True, column_config=col_cfg)
 
     # --- Efficient frontier -----------------------------------------------------
     st.subheader("Efficient frontier")
