@@ -17,3 +17,4 @@ plotly==6.8.0
 pandas==2.3.3
 numpy==2.2.6
 scipy==1.15.3
+python-dotenv==1.2.2        # auto-loads .env (IBM_QUANTUM_TOKEN etc.) for local & server runs

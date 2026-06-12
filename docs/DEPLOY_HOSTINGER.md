@@ -83,6 +83,27 @@ docker compose up -d --build
 
 ---
 
+## Option C — no Docker: nginx + systemd (bare-metal VPS)
+
+Prefer a classic setup without containers? The repo ships a one-shot script
+that installs Python, nginx and certbot, creates a dedicated system user and a
+systemd service (auto-restart on crash and reboot), and provisions HTTPS:
+
+```bash
+ssh root@<your-vps-ip>
+git clone https://github.com/off-JnS/Quantum-Optimizing.git
+cd Quantum-Optimizing
+DOMAIN=quantum.yourdomain.com bash deploy/setup.sh
+# afterwards: edit /opt/quantum-optimizer/.env to add IBM_QUANTUM_TOKEN,
+# then: systemctl restart quantum-optimizer
+```
+
+The pieces it installs are in the repo if you want to customize them:
+`deploy/quantum-optimizer.service` (systemd unit, reads `.env`) and
+`deploy/nginx.conf` (reverse proxy with the WebSocket headers Streamlit needs).
+
+---
+
 ## Why this stays up 24/7
 
 * `restart: unless-stopped` on both containers — Docker revives the app after

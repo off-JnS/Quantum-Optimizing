@@ -15,12 +15,21 @@ Deploy with Docker:  docker compose up -d   (see docs/DEPLOY_HOSTINGER.md)
 
 from __future__ import annotations
 
+import os
 import traceback
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+# Load a local .env file (IBM_QUANTUM_TOKEN, IBM_QUANTUM_BACKEND, …) if present,
+# so local runs and bare-metal servers behave like the Docker deployment.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:  # pragma: no cover - pinned in requirements
+    pass
 
 from quantum_portfolio import MAX_TICKERS, MIN_HISTORY_DAYS
 from quantum_portfolio.data import (
@@ -168,7 +177,10 @@ def sidebar_config() -> dict:
         )
         backend_name = st.sidebar.text_input(
             "Backend name (optional)",
-            help="Leave empty to automatically pick the least busy device.",
+            value=os.environ.get("IBM_QUANTUM_BACKEND", ""),
+            help="e.g. ibm_torino. Leave empty to automatically pick the least "
+                 "busy device. Can also be preset via the IBM_QUANTUM_BACKEND "
+                 "environment variable.",
         )
         allow_fallback = st.sidebar.checkbox(
             "Fall back to the local simulator if IBM is unavailable", value=True

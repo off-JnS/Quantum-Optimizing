@@ -6,5 +6,6 @@ __pycache__
 docs
 README.md
 .streamlit/secrets.toml
+.env
 .gitignore
 .dockerignore

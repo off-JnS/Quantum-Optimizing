@@ -38,9 +38,16 @@ explains every step in plain language.
 ├── docs/
 │   ├── USAGE.md                # 📖 full manual: every control, IBM setup, scaling
 │   └── DEPLOY_HOSTINGER.md     # 🚀 host it 24/7 on a Hostinger VPS from GitHub
+├── LOCAL_SETUP.md              # local runs + free hosting alternatives (ngrok, Streamlit Cloud)
+├── START_APP.bat               # Windows one-click launcher
+├── .env.example                # template for IBM_QUANTUM_TOKEN / DOMAIN (copy to .env)
 ├── Dockerfile                  # production image
 ├── docker-compose.yml          # app + Caddy reverse proxy (auto-HTTPS)
-├── deploy/Caddyfile
+├── deploy/
+│   ├── Caddyfile               # Docker route (auto-HTTPS)
+│   ├── setup.sh                # no-Docker route: one-shot nginx + systemd + certbot
+│   ├── nginx.conf              #   …its reverse-proxy config
+│   └── quantum-optimizer.service  # …its systemd unit
 ├── .streamlit/config.toml      # dark theme
 └── requirements.txt            # exact, mutually verified pins
 ```
@@ -53,10 +60,13 @@ Python 3.10 – 3.12 on Windows, macOS or Linux:
 python -m venv .venv
 # Windows: .venv\Scripts\activate     macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env             # optional: add your IBM_QUANTUM_TOKEN
 streamlit run app.py
 ```
 
+Windows users can simply double-click **`START_APP.bat`** instead.
 Or with Docker: `docker compose up -d` → http://localhost
+More local options (LAN sharing, ngrok, free cloud hosts): [LOCAL_SETUP.md](LOCAL_SETUP.md)
 
 ## Using IBM Quantum hardware
 
