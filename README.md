@@ -1,104 +1,101 @@
 # ⚛️ Quantum Portfolio Optimizer
 
-A single-file Streamlit app that picks an investment portfolio with a **real quantum
-algorithm (QAOA)** running on a **local quantum simulator** — no IBM account, no API
-keys, no paid services.
+A Streamlit web app that builds stock portfolios with a **real quantum
+algorithm (QAOA)** — running on **IBM Quantum hardware via the cloud API** or
+on a local simulator — for universes of **up to 500 stocks**.
 
-Type in a few stock tickers and an amount in euros; the app downloads one year of
-real market data, lets a quantum algorithm decide *which* stocks deserve your money,
-sizes the positions classically, and shows you the result as a pie chart, an
-allocation table, and an efficient-frontier plot.
+Paste tickers, set an amount in euros and a risk tolerance; the app downloads
+a year of real market data, screens the field, lets QAOA pick the stocks
+through a chunked quantum tournament, sizes the positions classically, and
+explains every step in plain language.
 
 > **Educational demo — not financial advice.**
 
-## Features
+---
 
-- 📈 Real historical data — 1 year of daily prices from Yahoo Finance (via `yfinance`)
-- ⚛️ Quantum stock selection — QAOA on qiskit-finance's `PortfolioOptimization`
-  QUBO, executed on the local Qiskit **Aer** simulator
-- 🎚️ Risk tolerance slider (low / medium / high) that drives the return-vs-risk
-  trade-off in *both* the quantum and classical stages
-- 🥧 Results: allocation pie chart, per-stock table (%, €, expected return
-  contribution), efficient frontier with your portfolio highlighted, and headline
-  metrics (expected annual return, volatility, Sharpe)
-- 🛟 Robust fallback: if QAOA fails or exceeds its time budget, a classical solver
-  takes over and the result is clearly labeled **classical fallback**
-- 🗣️ A plain-language box explaining honestly what the quantum algorithm did
-- 🌙 Clean dark theme, mobile-friendly layout, cached data fetches
+## Highlights
 
-## Quickstart
+- ⚛️ **Real quantum hardware**: one click switches between IBM Quantum
+  (API key) and the bundled Aer simulator (free, no account)
+- 📈 **Up to 500 tickers**: classical screening + hierarchical QAOA tournament
+  keep every quantum subproblem within today's qubit counts
+- 🛟 **Honest fallbacks**: timeout or failure → classical solver, always
+  clearly labeled; nothing fails silently
+- 📊 **Full results**: allocation pie + table + CSV export, efficient
+  frontier, expected return / volatility / Sharpe, plain-language report
+- 🐳 **Deploy-ready**: Dockerfile + compose + auto-HTTPS proxy — push the repo
+  to a Hostinger VPS and it runs 24/7
 
-Requires **Python 3.10 – 3.12** on Windows, macOS, or Linux.
+## Project structure
+
+```
+├── app.py                      # Streamlit UI (entry point)
+├── quantum_portfolio/          # core package
+│   ├── data.py                 #   tickers, Yahoo Finance, validation, statistics
+│   ├── engines.py              #   IBM Quantum / local Aer execution engines
+│   └── optimizer.py            #   screening, QAOA tournament, fallbacks, weighting
+├── scripts/smoke_test.py       # 17 headless checks (run after install)
+├── docs/
+│   ├── USAGE.md                # 📖 full manual: every control, IBM setup, scaling
+│   └── DEPLOY_HOSTINGER.md     # 🚀 host it 24/7 on a Hostinger VPS from GitHub
+├── Dockerfile                  # production image
+├── docker-compose.yml          # app + Caddy reverse proxy (auto-HTTPS)
+├── deploy/Caddyfile
+├── .streamlit/config.toml      # dark theme
+└── requirements.txt            # exact, mutually verified pins
+```
+
+## Quickstart (local)
+
+Python 3.10 – 3.12 on Windows, macOS or Linux:
 
 ```bash
-# 1. Create and activate a virtual environment
 python -m venv .venv
-
-#    Windows:
-.venv\Scripts\activate
-#    macOS / Linux:
-source .venv/bin/activate
-
-# 2. Install the pinned dependencies
+# Windows: .venv\Scripts\activate     macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-
-# 3. Run the app (opens in your browser)
 streamlit run app.py
 ```
 
-The only network access the app ever needs is the Yahoo Finance download when you
-press **Optimize** — everything else, including the quantum simulation, runs
-entirely on your machine.
+Or with Docker: `docker compose up -d` → http://localhost
 
-## How it works
+## Using IBM Quantum hardware
 
-1. **Measure the market.** One year of daily closes per ticker → annualized expected
-   returns **μ** and covariance matrix **Σ**.
-2. **Quantum stage — which stocks?** Holding/not-holding each stock is one binary
-   decision (one **qubit** per ticker). qiskit-finance's `PortfolioOptimization`
-   turns "maximize `μ·x − q·(x·Σ·x)` while holding exactly *B* stocks" into a QUBO,
-   and **QAOA** (a variational quantum algorithm) searches the 2ⁿ possible
-   combinations on the Aer simulator. The risk slider sets the risk-aversion *q*.
-3. **Classical stage — how much of each?** Within the chosen stocks, a classical
-   SLSQP optimizer maximizes the same objective over continuous long-only weights
-   summing to 1. This split is shown as your allocation.
-4. **Fallbacks.** If QAOA times out or errors, the *same* QUBO is solved exactly by
-   a classical eigensolver (instant at ≤ 8 stocks). If even that fails, you get a
-   classical minimum-variance portfolio. Both cases are labeled prominently.
+1. Create a free account at [quantum.cloud.ibm.com](https://quantum.cloud.ibm.com)
+   and generate an **API key**.
+2. Paste it in the app's sidebar — or set `IBM_QUANTUM_TOKEN` in the
+   environment (the right way on a server).
+3. Pick *IBM Quantum hardware* in the sidebar and optimize. The app chooses
+   the least busy device automatically and falls back to the local simulator
+   (with a visible warning) if IBM is unreachable.
 
-## Limitations (a.k.a. honesty corner)
+⏱️ The free Open plan includes ~10 minutes of QPU time per month and public
+devices queue — see [docs/USAGE.md](docs/USAGE.md) for quota-friendly settings.
 
-- **Max 8 tickers** — each stock is one qubit and a laptop-grade simulator slows
-  down quickly beyond that. This is a hardware-era limitation of the demo, not of
-  the math.
-- The quantum advantage here is **illustrative**: with ≤ 8 stocks a classical
-  computer checks all combinations instantly. QAOA's promise is at scales where
-  2ⁿ enumeration becomes impossible.
-- Expected returns are estimated from one year of history — the standard caveat
-  that past performance does not predict future results very much applies.
-- A QAOA run abandoned by the timeout finishes quietly in the background (its
-  iterations are bounded); this is harmless.
+## How it scales to 500 stocks
 
-## Troubleshooting
+One qubit per stock per subproblem is the hard physical constraint, so the
+optimizer is hybrid: a classical pre-screen reduces the universe to a quantum
+pool (default 32), then a **tournament of QAOA subproblems** (chunks of 4–32
+qubits) eliminates candidates round by round until exactly your requested
+number of stocks remains. Positions are then sized classically with the same
+gain-versus-risk objective. The result banner reports how many quantum
+subproblems ran, on which backend, and at what size — and the *What happened*
+tab explains it all without jargon.
 
-| Symptom | What it means / what to do |
-|---|---|
-| "No price data found for: XYZ" | The ticker doesn't exist on Yahoo Finance. Non-US listings need an exchange suffix: `SAP.DE` (Xetra), `AIR.PA` (Paris), `7203.T` (Tokyo). |
-| "Excluded XYZ: fewer than 60 days of price history" | The ticker is valid but too new (recent IPO) or too thinly traded for meaningful statistics — it's left out so it doesn't shrink the usable history of your other stocks. |
-| Yahoo Finance download fails or hangs | Yahoo rate-limits aggressively. Wait a minute and retry — successful fetches are cached for an hour, so re-optimizing the same tickers won't re-download. |
-| Result says **classical fallback** | The quantum run failed or exceeded its time budget; the answer shown was computed classically (and exactly). Raise the time budget or lower shots/depth in ⚙️ Advanced settings to try quantum again. |
-| First optimization feels slow | The first QAOA run compiles circuits and warms up Aer; subsequent runs are faster. |
-| `pip install` fails on Python 3.13 | Use Python 3.10 – 3.12; the pinned scientific stack targets those versions. |
+## Hosting it 24/7 on Hostinger
 
-## Verifying the install (optional)
+The repo deploys as-is on a Hostinger **VPS** (shared hosting can't run
+Python servers): hPanel → Docker Manager → paste the repo URL → set
+`IBM_QUANTUM_TOKEN` and `DOMAIN` → deploy. Caddy provisions HTTPS
+automatically and Docker restarts the app after crashes and reboots.
+
+**Step-by-step guide: [docs/DEPLOY_HOSTINGER.md](docs/DEPLOY_HOSTINGER.md)**
+
+## Verifying an install
 
 ```bash
-python scripts/smoke_test.py
+python scripts/smoke_test.py     # 17 checks, all should PASS
 ```
-
-Runs the full pipeline headlessly on synthetic data: the QAOA selection, the
-timeout-fallback path, the weighting stage, and the yfinance response-shape
-handling. Every line should say `PASS` (the live-fetch check may `SKIP` offline).
 
 ## Tested versions
 
@@ -106,15 +103,10 @@ handling. Every line should say `PASS` (the live-fetch check may `SKIP` offline)
 |---|---|
 | qiskit | 2.4.1 |
 | qiskit-aer | 0.17.2 |
-| qiskit-optimization | 0.7.0 |
-| qiskit-finance | 0.4.1 |
-| qiskit-algorithms | 0.4.0 |
-| streamlit | 1.58.0 |
-| yfinance | 1.4.1 |
-| plotly | 6.8.0 |
+| qiskit-ibm-runtime | 0.47.0 |
+| qiskit-optimization / -finance / -algorithms | 0.7.0 / 0.4.1 / 0.4.0 |
+| streamlit / yfinance / plotly | 1.58.0 / 1.4.1 / 6.8.0 |
 | pandas / numpy / scipy | 2.3.3 / 2.2.6 / 1.15.3 |
 
-> Note for qiskit veterans: since qiskit-optimization 0.7.0 the QAOA used with
-> `MinimumEigenOptimizer` is the one vendored in
-> `qiskit_optimization.minimum_eigensolvers` (qiskit-algorithms remains installed
-> as a qiskit-finance dependency).
+Python 3.10 – 3.12 · Windows, macOS, Linux · No paid APIs; the only network
+calls are Yahoo Finance downloads and (optionally) IBM Quantum jobs.

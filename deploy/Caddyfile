@@ -1,0 +1,6 @@
+# Reverse proxy in front of Streamlit.
+# DOMAIN=quantum.example.com  -> automatic HTTPS (Let's Encrypt)
+# DOMAIN unset (defaults :80) -> plain HTTP on the VPS IP
+{$DOMAIN} {
+	reverse_proxy app:8501
+}

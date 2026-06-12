@@ -8,6 +8,7 @@ qiskit-aer==0.17.2
 qiskit-optimization==0.7.0
 qiskit-finance==0.4.1
 qiskit-algorithms==0.4.0    # transitive requirement of qiskit-finance; 0.4.0 is the Qiskit-2.x-compatible release
+qiskit-ibm-runtime==0.47.0  # real IBM Quantum hardware via the cloud API
 
 # Data / app stack — newest versions that still support Python 3.10 on Windows and macOS
 streamlit==1.58.0

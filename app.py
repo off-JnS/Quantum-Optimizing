@@ -1,357 +1,83 @@
 """
-⚛️ Quantum Portfolio Optimizer
-==============================
+⚛️ Quantum Portfolio Optimizer — Streamlit UI
+=============================================
 
-A single-file Streamlit app that:
-  1. fetches one year of real daily price data for user-supplied stock tickers
-     (Yahoo Finance via yfinance),
-  2. runs a QAOA quantum optimization (qiskit-finance's PortfolioOptimization
-     QUBO, solved on the local Qiskit Aer simulator — no IBM account needed)
-     to select which stocks to hold,
-  3. sizes the positions within the selected stocks with a classical optimizer
-     using the same return-vs-risk objective, and
-  4. displays the optimal allocation (pie chart, table, efficient frontier,
-     metrics) with a plain-language explanation.
+Optimizes a stock portfolio of up to 500 tickers with QAOA running either on
+real IBM Quantum hardware (cloud API) or on the local Qiskit Aer simulator.
 
-If the quantum step fails or exceeds its time budget, the app falls back to a
-classical solver and clearly labels the result as a classical fallback.
+Pipeline (see quantum_portfolio/optimizer.py for details):
+  data download -> classical screening -> hierarchical QAOA tournament
+  -> classical position sizing -> charts, tables and a plain-language report.
 
-Run with:  streamlit run app.py
+Run locally with:   streamlit run app.py
+Deploy with Docker:  docker compose up -d   (see docs/DEPLOY_HOSTINGER.md)
 """
 
 from __future__ import annotations
 
-import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeout
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
-from scipy.optimize import minimize
 
-# --- Quantum stack -----------------------------------------------------------
-# qiskit-optimization >= 0.7 vendors QAOA / COBYLA / NumPyMinimumEigensolver,
-# so the whole pipeline needs no IBM account: everything runs on qiskit-aer.
-from qiskit.transpiler import generate_preset_pass_manager
-from qiskit_aer import AerSimulator
-from qiskit_aer.primitives import SamplerV2 as AerSamplerV2
-from qiskit_finance.applications.optimization import PortfolioOptimization
-from qiskit_optimization.algorithms import MinimumEigenOptimizer
-from qiskit_optimization.minimum_eigensolvers import QAOA, NumPyMinimumEigensolver
-from qiskit_optimization.optimizers import COBYLA
-from qiskit_optimization.utils import algorithm_globals
+from quantum_portfolio import MAX_TICKERS, MIN_HISTORY_DAYS
+from quantum_portfolio.data import (
+    annualized_stats,
+    download_close,
+    parse_tickers,
+    validate_prices,
+)
+from quantum_portfolio.engines import (
+    build_ibm_engine,
+    build_local_engine,
+    resolve_ibm_token,
+)
+from quantum_portfolio.optimizer import (
+    RISK_MAP,
+    SEED,
+    optimize_portfolio,
+    random_portfolios,
+)
 
-# ==============================================================================
-# Constants
-# ==============================================================================
+N_RANDOM_PORTFOLIOS = 3000  # cloud size for the efficient-frontier chart
+DUST_WEIGHT = 0.0005        # hide sub-0.05% "dust" positions in the pie chart
+MAX_PIE_SLICES = 15         # group smaller holdings into "Other" beyond this
+DEFAULT_TICKERS = "AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA, JPM, V, JNJ, XOM, SAP.DE"
 
-MAX_TICKERS = 8            # one qubit per ticker — 8 keeps QAOA fast on a laptop simulator
-MIN_HISTORY_DAYS = 60      # minimum overlapping trading days required
-TRADING_DAYS = 252         # annualization factor for daily returns
-N_RANDOM_PORTFOLIOS = 3000 # cloud of random portfolios for the efficient-frontier chart
-QAOA_TIMEOUT_S = 90        # default time budget before falling back to a classical solver
-DUST_WEIGHT = 0.0005       # hide sub-0.05% "dust" positions in the pie chart
-SEED = 42
-
-# Risk tolerance -> risk-aversion coefficient q in the objective  max  μ·w − q·(w·Σ·w).
-# A cautious investor penalizes variance heavily; an aggressive one barely at all.
-# NOTE: these values are calibrated for ANNUALIZED μ and Σ (daily stats × TRADING_DAYS);
-# if you change the annualization, rescale q accordingly.
-RISK_MAP = {"Low": 2.0, "Medium": 1.0, "High": 0.25}
+MODE_IBM = "IBM Quantum hardware (cloud API)"
+MODE_LOCAL = "Local simulator (this machine)"
 
 
 # ==============================================================================
-# Data layer
+# Cached wrappers around the pure package functions
 # ==============================================================================
-
-def parse_tickers(text: str) -> list[str]:
-    """Split a comma-separated string into a deduplicated, uppercased ticker list."""
-    seen: set[str] = set()
-    tickers: list[str] = []
-    for part in text.replace(";", ",").split(","):
-        ticker = part.strip().upper()
-        if ticker and ticker not in seen:
-            seen.add(ticker)
-            tickers.append(ticker)
-    return tickers
-
-
-def extract_close(raw: pd.DataFrame | pd.Series, tickers: list[str]) -> pd.DataFrame:
-    """Return a plain DataFrame of closing prices (one column per ticker).
-
-    yfinance returns different shapes depending on version and ticker count:
-    MultiIndex (Price, Ticker) columns, flat OHLCV columns, or a bare Series.
-    """
-    if isinstance(raw, pd.Series):
-        return raw.to_frame(name=tickers[0]).copy()
-    if isinstance(raw.columns, pd.MultiIndex):
-        if "Close" not in raw.columns.get_level_values(0):
-            raise ValueError(
-                "Unrecognized price data format from yfinance "
-                f"(no 'Close' level in columns: {list(raw.columns)[:8]}…)"
-            )
-        close = raw["Close"]
-        if isinstance(close, pd.Series):  # single ticker under a MultiIndex
-            close = close.to_frame(name=tickers[0])
-        return close.copy()
-    if "Close" in raw.columns:  # flat single-ticker frame
-        return raw[["Close"]].rename(columns={"Close": tickers[0]}).copy()
-    # Fail loudly on an unrecognized layout rather than silently mislabeling
-    # every ticker as invalid downstream.
-    raise ValueError(
-        f"Unrecognized price data format from yfinance (columns: {list(raw.columns)})"
-    )
-
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_prices(tickers: tuple[str, ...]) -> pd.DataFrame:
-    """Download 1 year of daily (adjusted) closes. Cached for an hour so
-    re-running the optimizer on the same tickers does not re-download."""
-    raw = yf.download(
-        list(tickers),
-        period="1y",
-        interval="1d",
-        auto_adjust=True,   # adjust for splits/dividends
-        progress=False,
-        group_by="column",
-    )
-    if raw is None or len(raw) == 0:
-        raise RuntimeError("Yahoo Finance returned no data for these tickers.")
-    return extract_close(raw, list(tickers))
+    """Cached for an hour so re-running the optimizer on the same universe
+    doesn't re-download ~500 price histories."""
+    return download_close(tickers)
 
 
-def validate_prices(
-    close: pd.DataFrame, tickers: list[str]
-) -> tuple[pd.DataFrame, list[str], list[str], list[str]]:
-    """Classify tickers and align the survivors on common trading days.
-
-    Returns (aligned_closes, valid, invalid, short) where `invalid` tickers had
-    no data at all and `short` ones had fewer than MIN_HISTORY_DAYS prices
-    (e.g. a recent IPO) — kept separate so each gets an accurate warning, and
-    excluded so one short series can't truncate everyone's overlap window.
-    """
-    close = close.reindex(columns=list(tickers))
-    counts = close.notna().sum()
-    invalid = [t for t in tickers if counts[t] == 0]
-    short = [t for t in tickers if 0 < counts[t] < MIN_HISTORY_DAYS]
-    valid = [t for t in tickers if counts[t] >= MIN_HISTORY_DAYS]
-    aligned = close[valid].dropna()  # keep only days where every market traded
-    return aligned, valid, invalid, short
-
-
-def annualized_stats(close: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Annualized mean-return vector μ and covariance matrix Σ from daily closes."""
-    returns = close.pct_change(fill_method=None).dropna()
-    mu = returns.mean().to_numpy() * TRADING_DAYS
-    sigma = returns.cov().to_numpy() * TRADING_DAYS
-    # Numerical guard: nudge Σ onto the positive-semidefinite cone if needed.
-    if np.linalg.eigvalsh(sigma).min() < 1e-10:
-        sigma = sigma + 1e-8 * np.eye(len(mu))
-    return mu, sigma
-
-
-# ==============================================================================
-# Optimization layer
-# ==============================================================================
-
-def _portfolio_qp(mu: np.ndarray, sigma: np.ndarray, q: float, budget: int):
-    """Build qiskit-finance's portfolio QUBO:
-    maximize  μ·x − q·(x·Σ·x)   subject to   Σx = budget,   x ∈ {0,1}ⁿ."""
-    problem = PortfolioOptimization(
-        expected_returns=mu, covariances=sigma, risk_factor=q, budget=budget
-    )
-    return problem.to_quadratic_program()
-
-
-def _check_feasible(result, budget: int) -> np.ndarray:
-    selection = np.asarray(np.round(result.x), dtype=int)
-    if result.status.name != "SUCCESS" or int(selection.sum()) != int(budget):
-        raise RuntimeError(
-            f"solver returned an infeasible selection "
-            f"(picked {int(selection.sum())} stocks instead of {budget})"
-        )
-    return selection
-
-
-def run_qaoa_selection(
-    mu: np.ndarray,
-    sigma: np.ndarray,
-    q: float,
-    budget: int,
-    *,
-    reps: int = 2,
-    shots: int = 1024,
-    maxiter: int = 150,
-    seed: int = SEED,
-) -> np.ndarray:
-    """Stage 1 (quantum): QAOA on the local Aer simulator picks which stocks to hold."""
-    algorithm_globals.random_seed = seed
-    qp = _portfolio_qp(mu, sigma, q, budget)
-    # The QAOA ansatz must be transpiled to the simulator's basis gates (V2 primitives).
-    pass_manager = generate_preset_pass_manager(
-        optimization_level=1, backend=AerSimulator()
-    )
-    qaoa = QAOA(
-        sampler=AerSamplerV2(default_shots=shots, seed=seed),
-        optimizer=COBYLA(maxiter=maxiter),
-        reps=reps,
-        pass_manager=pass_manager,
-    )
-    result = MinimumEigenOptimizer(qaoa).solve(qp)
-    selection = np.asarray(np.round(result.x), dtype=int)
-    if result.status.name == "SUCCESS" and int(selection.sum()) == int(budget):
-        return selection
-    # Shot noise can make the single lowest-energy sample violate the budget
-    # constraint even when plenty of feasible samples were measured — rescue
-    # the best feasible one before declaring the quantum run a failure.
-    samples = sorted(getattr(result, "samples", None) or [], key=lambda s: s.fval)
-    for sample in samples:
-        x = np.asarray(np.round(sample.x), dtype=int)
-        if int(x.sum()) == int(budget):
-            return x
-    raise RuntimeError(
-        f"QAOA produced no measurement holding exactly {budget} stocks"
-    )
-
-
-def run_exact_selection(
-    mu: np.ndarray, sigma: np.ndarray, q: float, budget: int
-) -> np.ndarray:
-    """Classical fallback: solve the exact same QUBO exactly (trivial for ≤ 8 stocks)."""
-    qp = _portfolio_qp(mu, sigma, q, budget)
-    result = MinimumEigenOptimizer(NumPyMinimumEigensolver()).solve(qp)
-    return _check_feasible(result, budget)
-
-
-def selection_with_fallback(
-    mu: np.ndarray,
-    sigma: np.ndarray,
-    q: float,
-    budget: int,
-    *,
-    timeout_s: float = QAOA_TIMEOUT_S,
-    **qaoa_kwargs,
-) -> tuple[np.ndarray | None, str, str | None]:
-    """Try QAOA with a hard time budget; fall back to classical solvers.
-
-    Returns (selection, method, fallback_reason) where method is one of
-    "quantum", "classical" (exact solve of the same problem) or
-    "min_variance" (last resort — caller computes minimum-variance weights).
-    """
-    # Deliberately NOT a `with` block: ThreadPoolExecutor.__exit__ would join the
-    # still-running QAOA worker and defeat the timeout. shutdown(wait=False)
-    # abandons it instead; the bounded shots/maxiter guarantee it terminates.
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(run_qaoa_selection, mu, sigma, q, budget, **qaoa_kwargs)
-    try:
-        return future.result(timeout=timeout_s), "quantum", None
-    except FuturesTimeout:
-        reason = f"QAOA did not finish within its {timeout_s:.0f} s time budget on the simulator"
-    except Exception as exc:
-        reason = f"QAOA failed ({exc})"
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-
-    try:
-        return run_exact_selection(mu, sigma, q, budget), "classical", reason
-    except Exception as exc:
-        reason = f"{reason}; the exact classical solver also failed ({exc})"
-        return None, "min_variance", reason
-
-
-def _long_only_solve(objective, n: int) -> np.ndarray:
-    """Minimize `objective(w)` over long-only weights summing to 1 (SLSQP).
-    Falls back to equal weights if the solver returns NaN/inf or degenerates
-    (note: a plain `sum <= 0` check would NOT catch NaN — NaN compares False)."""
-    result = minimize(
-        objective,
-        np.full(n, 1.0 / n),
-        method="SLSQP",
-        bounds=[(0.0, 1.0)] * n,
-        constraints=[{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}],
-    )
-    weights = np.clip(result.x, 0.0, None)
-    if not np.isfinite(weights).all() or weights.sum() <= 0:
-        weights = np.full(n, 1.0 / n)
-    return weights / weights.sum()
-
-
-def slsqp_weights(mu_sel: np.ndarray, sigma_sel: np.ndarray, q: float) -> np.ndarray:
-    """Stage 2 (classical): continuous long-only weights within the selected stocks,
-    maximizing the same utility  μ·w − q·(w·Σ·w)  with weights summing to 1."""
-    return _long_only_solve(
-        lambda w: -(mu_sel @ w - q * (w @ sigma_sel @ w)), len(mu_sel)
-    )
-
-
-def min_variance_weights(sigma: np.ndarray) -> np.ndarray:
-    """Last-resort classical fallback: long-only minimum-variance portfolio
-    across ALL assets (ignores expected returns entirely)."""
-    return _long_only_solve(lambda w: w @ sigma @ w, len(sigma))
-
-
-def optimize_portfolio(
-    mu: np.ndarray,
-    sigma: np.ndarray,
-    q: float,
-    budget: int,
-    *,
-    reps: int,
-    shots: int,
-    maxiter: int,
-    timeout_s: float,
-    seed: int,
-) -> dict:
-    """Full two-stage pipeline: quantum stock selection, then classical sizing."""
-    t0 = time.perf_counter()
-    selection, method, reason = selection_with_fallback(
-        mu, sigma, q, budget,
-        timeout_s=timeout_s, reps=reps, shots=shots, maxiter=maxiter, seed=seed,
-    )
-    n = len(mu)
-    if method == "min_variance":  # both solvers failed — minimum-variance over everything
-        selection = np.ones(n, dtype=int)
-        weights = min_variance_weights(sigma)
-    else:
-        idx = np.flatnonzero(selection)
-        weights = np.zeros(n)
-        weights[idx] = slsqp_weights(mu[idx], sigma[np.ix_(idx, idx)], q)
-
-    exp_return = float(weights @ mu)
-    volatility = float(np.sqrt(max(weights @ sigma @ weights, 0.0)))
-    return {
-        "method": method,
-        "fallback_reason": reason,
-        "selection": selection,
-        "weights": weights,
-        "exp_return": exp_return,
-        "volatility": volatility,
-        "sharpe": exp_return / volatility if volatility > 0 else 0.0,
-        "elapsed_s": time.perf_counter() - t0,
-    }
+@st.cache_data(show_spinner=False)
+def cached_random_portfolios(mu: np.ndarray, sigma: np.ndarray, n: int, seed: int):
+    return random_portfolios(mu, sigma, n, seed)
 
 
 # ==============================================================================
 # Charts
 # ==============================================================================
 
-@st.cache_data(show_spinner=False)
-def random_portfolios(
-    mu: np.ndarray, sigma: np.ndarray, n_portfolios: int, seed: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Vectorized cloud of random long-only portfolios for the frontier chart."""
-    rng = np.random.default_rng(seed)
-    w = rng.dirichlet(np.ones(len(mu)), n_portfolios)
-    rets = w @ mu
-    vols = np.sqrt(((w @ sigma) * w).sum(axis=1))
-    return rets, vols
-
-
 def pie_fig(tickers: list[str], amounts: list[float]) -> go.Figure:
+    """Donut of euro amounts; small holdings grouped into 'Other' so a
+    30-stock portfolio stays readable."""
+    if len(tickers) > MAX_PIE_SLICES:
+        keep = MAX_PIE_SLICES - 1
+        other = float(sum(amounts[keep:]))
+        tickers = tickers[:keep] + [f"Other ({len(amounts) - keep} stocks)"]
+        amounts = amounts[:keep] + [other]
     fig = go.Figure(
         go.Pie(
             labels=tickers,
@@ -361,18 +87,14 @@ def pie_fig(tickers: list[str], amounts: list[float]) -> go.Figure:
             hovertemplate="%{label}: €%{value:,.2f}<extra></extra>",
         )
     )
-    fig.update_layout(
-        height=380,
-        margin=dict(t=30, b=10, l=10, r=10),
-        showlegend=False,
-    )
+    fig.update_layout(height=400, margin=dict(t=30, b=10, l=10, r=10), showlegend=False)
     return fig
 
 
 def frontier_fig(
-    mu: np.ndarray, sigma: np.ndarray, opt_ret: float, opt_vol: float, seed: int
+    mu_pool: np.ndarray, sigma_pool: np.ndarray, opt_ret: float, opt_vol: float, seed: int
 ) -> go.Figure:
-    rets, vols = random_portfolios(mu, sigma, N_RANDOM_PORTFOLIOS, seed)
+    rets, vols = cached_random_portfolios(mu_pool, sigma_pool, N_RANDOM_PORTFOLIOS, seed)
     sharpe = np.divide(rets, vols, out=np.zeros_like(rets), where=vols > 0)
     fig = go.Figure()
     fig.add_trace(
@@ -381,12 +103,8 @@ def frontier_fig(
             y=rets * 100,
             mode="markers",
             marker=dict(
-                size=5,
-                opacity=0.55,
-                color=sharpe,
-                colorscale="Viridis",
-                showscale=True,
-                colorbar=dict(title="Sharpe"),
+                size=5, opacity=0.55, color=sharpe, colorscale="Viridis",
+                showscale=True, colorbar=dict(title="Sharpe"),
             ),
             name="Random portfolios",
             hovertemplate="Risk %{x:.1f}% · Return %{y:.1f}%<extra></extra>",
@@ -416,35 +134,147 @@ def frontier_fig(
 
 
 # ==============================================================================
-# UI
+# Sidebar — quantum engine & algorithm configuration
 # ==============================================================================
 
-def run_pipeline(
-    tickers: list[str],
-    amount: float,
-    risk_label: str,
-    budget: int | None,
-    reps: int,
-    shots: int,
-    maxiter: int,
-    timeout_s: float,
-    seed: int,
-) -> None:
+def sidebar_config() -> dict:
+    st.sidebar.header("⚙️ Quantum engine")
+    mode = st.sidebar.radio(
+        "Where should the quantum circuits run?",
+        [MODE_IBM, MODE_LOCAL],
+        help="IBM Quantum runs QAOA on a real quantum processor via the cloud "
+             "API. The local simulator is free, instant and needs no account.",
+    )
+    is_ibm = mode == MODE_IBM
+
+    token = instance = backend_name = ""
+    allow_fallback = True
+    if is_ibm:
+        token = st.sidebar.text_input(
+            "IBM Quantum API key",
+            type="password",
+            help="Create one at https://quantum.cloud.ibm.com → Access management "
+                 "→ API keys. On a server, set the IBM_QUANTUM_TOKEN environment "
+                 "variable instead of pasting it here.",
+        )
+        if not resolve_ibm_token(token):
+            st.sidebar.warning(
+                "No API key yet — paste one above or set IBM_QUANTUM_TOKEN. "
+                "Until then, runs fall back to the local simulator."
+            )
+        instance = st.sidebar.text_input(
+            "Instance CRN (optional)",
+            help="Leave empty to use your account's default instance.",
+        )
+        backend_name = st.sidebar.text_input(
+            "Backend name (optional)",
+            help="Leave empty to automatically pick the least busy device.",
+        )
+        allow_fallback = st.sidebar.checkbox(
+            "Fall back to the local simulator if IBM is unavailable", value=True
+        )
+        st.sidebar.caption(
+            "💡 Hardware runs queue behind other users and consume your IBM "
+            "quota (the free Open plan includes ~10 min of QPU time per month), "
+            "so the defaults below are deliberately frugal."
+        )
+
+    with st.sidebar.expander("🔬 Algorithm settings"):
+        pool_size = st.slider(
+            "Quantum pool size (stocks screened in)", 8, 64, 32,
+            help="A classical pre-screen ranks all your tickers by risk-adjusted "
+                 "score and passes the best ones to the quantum stage.",
+        )
+        chunk_default, chunk_max = (16, 32) if is_ibm else (10, 16)
+        chunk_size = st.slider(
+            "Qubits per subproblem (chunk size)", 4, chunk_max, chunk_default,
+            key=f"chunk_{is_ibm}",
+            help="The tournament splits the pool into chunks of this many "
+                 "stocks; each chunk is one QAOA run with one qubit per stock.",
+        )
+        reps = st.slider("QAOA circuit depth (reps)", 1, 4, 1 if is_ibm else 2,
+                         key=f"reps_{is_ibm}")
+        shots = st.select_slider(
+            "Shots per circuit", options=[256, 512, 1024, 2048, 4096],
+            value=2048 if is_ibm else 1024, key=f"shots_{is_ibm}",
+        )
+        maxiter = st.slider(
+            "Optimizer iterations (COBYLA)", 5, 300, 20 if is_ibm else 150,
+            step=5, key=f"maxiter_{is_ibm}",
+            help="On real hardware every iteration is a separate cloud job — "
+                 "keep this small to respect queue times and your quota.",
+        )
+        timeout_s = st.slider(
+            "Time budget before classical fallback (seconds)",
+            30, 7200, 3600 if is_ibm else 120, step=30, key=f"timeout_{is_ibm}",
+        )
+        seed = int(st.number_input("Random seed", min_value=0, value=SEED, step=1))
+
+    st.sidebar.caption("📚 Full guide: see docs/USAGE.md in the repository.")
+    return {
+        "is_ibm": is_ibm,
+        "token": token,
+        "instance": instance,
+        "backend_name": backend_name,
+        "allow_fallback": allow_fallback,
+        "pool_size": pool_size,
+        "chunk_size": chunk_size,
+        "reps": reps,
+        "shots": shots,
+        "maxiter": maxiter,
+        "timeout_s": timeout_s,
+        "seed": seed,
+    }
+
+
+def build_engine(cfg: dict):
+    """Build the requested engine; optionally fall back to the local simulator
+    with a visible warning (never silently)."""
+    if not cfg["is_ibm"]:
+        return build_local_engine(cfg["shots"], cfg["seed"])
+    try:
+        return build_ibm_engine(
+            resolve_ibm_token(cfg["token"]),
+            cfg["instance"],
+            cfg["backend_name"],
+            cfg["shots"],
+            min_qubits=cfg["chunk_size"],
+        )
+    except ValueError as exc:
+        if not cfg["allow_fallback"]:
+            st.error(f"IBM Quantum is not reachable: {exc}")
+            return None
+        st.warning(f"⚠️ {exc} — **using the local simulator instead.**")
+        return build_local_engine(cfg["shots"], cfg["seed"])
+
+
+# ==============================================================================
+# Pipeline
+# ==============================================================================
+
+def _shortlist(names: list[str], limit: int = 12) -> str:
+    shown = ", ".join(names[:limit])
+    return shown + (f" … and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def run_pipeline(tickers: list[str], amount: float, risk_label: str,
+                 budget: int, cfg: dict) -> None:
     """Validate inputs, fetch data, optimize, and store everything in session_state."""
     if len(tickers) < 2:
-        st.error("Please enter at least **2** ticker symbols, separated by commas.")
+        st.error("Please enter at least **2** ticker symbols.")
         return
     if len(tickers) > MAX_TICKERS:
-        st.error(
-            f"Please enter at most **{MAX_TICKERS}** tickers — each stock uses one "
-            "qubit, and more would be slow on a local quantum simulator."
-        )
+        st.error(f"Please enter at most **{MAX_TICKERS}** tickers "
+                 f"(you entered {len(tickers)}).")
         return
 
     try:
-        with st.spinner(f"Fetching 1 year of daily prices for {', '.join(tickers)}…"):
-            # sorted() so "MSFT, AAPL" hits the same cache entry as "AAPL, MSFT";
-            # validate_prices restores the user's column order afterwards.
+        with st.spinner(
+            f"Downloading 1 year of daily prices for {len(tickers)} tickers — "
+            "large universes can take a minute on the first run…"
+        ):
+            # sorted() so the cache is order-independent; validate_prices
+            # restores the user's column order afterwards.
             close_raw = fetch_prices(tuple(sorted(tickers)))
         close, valid, invalid, short = validate_prices(close_raw, tickers)
     except Exception as exc:
@@ -459,49 +289,47 @@ def run_pipeline(
 
     if invalid:
         st.warning(
-            f"No price data found for: **{', '.join(invalid)}** — these look like "
-            "invalid tickers, so they were skipped. (Tip: non-US stocks need their "
+            f"No price data found for {len(invalid)} ticker(s): "
+            f"**{_shortlist(invalid)}** — skipped. (Tip: non-US stocks need an "
             "exchange suffix, e.g. SAP.DE.)"
         )
     if short:
         st.warning(
-            f"Excluded **{', '.join(short)}**: fewer than {MIN_HISTORY_DAYS} days of "
-            "price history (e.g. a recent IPO or thinly traded listing) — too little "
-            "data for meaningful statistics."
+            f"Excluded {len(short)} ticker(s) with fewer than {MIN_HISTORY_DAYS} "
+            f"days of history: **{_shortlist(short)}**."
         )
     if len(valid) < 2:
-        st.error("At least **2** tickers with valid price data are needed to optimize.")
+        st.error("At least **2** tickers with valid price data are needed.")
         return
     if len(close) < MIN_HISTORY_DAYS:
         st.error(
-            f"Only {len(close)} overlapping trading days of history were found — "
-            f"at least {MIN_HISTORY_DAYS} are needed for meaningful statistics."
+            f"Only {len(close)} overlapping trading days were found across these "
+            f"markets — at least {MIN_HISTORY_DAYS} are needed."
         )
         return
 
     mu, sigma = annualized_stats(close)
-    q = RISK_MAP[risk_label]
     n = len(valid)
-    # The budget slider tracked the typed ticker list; if tickers were dropped it
-    # can now be out of range — clamp it and tell the user instead of failing.
-    if budget is None or not (1 <= budget <= n):
-        clamped = min(n, max(2, n // 2))
-        if budget is not None:
-            st.info(
-                f"Adjusted the number of stocks to hold from {budget} to {clamped} "
-                f"because only {n} of your tickers have usable data."
-            )
-        budget = clamped
+    if budget > n:
+        st.info(f"Adjusted the number of stocks to hold from {budget} to {n} "
+                f"because only {n} tickers have usable data.")
+        budget = n
+
+    engine = build_engine(cfg)
+    if engine is None:
+        return
 
     try:
         with st.spinner(
-            f"Running QAOA on the local Aer quantum simulator "
-            f"({n} qubits, {2 ** n} possible stock combinations)…"
+            f"Optimizing on the {engine.label}: screening {n} stocks, then "
+            f"running QAOA subproblems of up to {min(cfg['chunk_size'], engine.max_qubits)} "
+            "qubits… (hardware jobs may queue — see the time budget in the sidebar)"
         ):
             result = optimize_portfolio(
-                mu, sigma, q, budget,
-                reps=reps, shots=shots, maxiter=maxiter,
-                timeout_s=timeout_s, seed=seed,
+                mu, sigma, RISK_MAP[risk_label], budget, engine,
+                pool_size=cfg["pool_size"], chunk_size=cfg["chunk_size"],
+                reps=cfg["reps"], maxiter=cfg["maxiter"],
+                timeout_s=cfg["timeout_s"], seed=cfg["seed"],
             )
     except Exception:
         st.error("The optimization failed unexpectedly. Please try again.")
@@ -512,162 +340,195 @@ def run_pipeline(
     st.session_state["result"] = {
         **result,
         "tickers": valid,
-        "invalid": invalid,
         "amount": float(amount),
         "risk_label": risk_label,
-        "q": q,
         "budget": budget,
         "mu": mu,
         "sigma": sigma,
-        "seed": seed,
+        "seed": cfg["seed"],
     }
 
 
+# ==============================================================================
+# Results
+# ==============================================================================
+
 def render_results(res: dict) -> None:
     st.divider()
+    stats = res["stats"]
 
-    # --- Method badge ---------------------------------------------------------
     if res["method"] == "quantum":
         st.success(
-            f"✅ **Optimized with quantum QAOA** on the local Aer simulator "
-            f"in {res['elapsed_s']:.1f} s."
+            f"✅ **Optimized with QAOA on the {res['engine_label']}** in "
+            f"{res['elapsed_s']:.1f} s — {stats['subproblems']} quantum "
+            f"subproblem(s), up to {stats['max_chunk']} qubits each."
         )
     elif res["method"] == "classical":
         st.warning(
             f"⚠️ **Classical fallback** — {res['fallback_reason']}. The same "
-            "stock-selection problem was solved exactly by a classical algorithm instead."
+            "selection tournament was solved by a classical algorithm instead."
         )
     else:
         st.warning(
-            f"⚠️ **Classical fallback (minimum variance)** — {res['fallback_reason']}. "
-            "A classical minimum-variance portfolio across all your stocks is shown instead."
+            f"⚠️ **Classical fallback (minimum variance)** — {res['fallback_reason']}."
         )
 
-    # --- Headline metrics ------------------------------------------------------
     m1, m2, m3 = st.columns(3)
     m1.metric("Expected annual return", f"{res['exp_return'] * 100:.1f} %")
     m2.metric("Risk (annual volatility)", f"{res['volatility'] * 100:.1f} %")
     m3.metric("Sharpe ratio", f"{res['sharpe']:.2f}")
 
-    # --- Allocation: pie + table ------------------------------------------------
     weights = res["weights"]
     amount = res["amount"]
     mu = res["mu"]
-    table = (
-        pd.DataFrame(
-            {
-                "Ticker": res["tickers"],
-                "Allocation": weights * 100,
-                "Amount": weights * amount,
-                "Expected return contribution": weights * mu * 100,
-                "Expected annual gain": weights * amount * mu,
-            }
-        )
-        .sort_values("Allocation", ascending=False)
-        .reset_index(drop=True)
+    tickers = res["tickers"]
+
+    full_table = pd.DataFrame(
+        {
+            "Ticker": tickers,
+            "Allocation %": weights * 100,
+            "Amount (EUR)": weights * amount,
+            "Return contribution (pp)": weights * mu * 100,
+            "Expected annual gain (EUR)": weights * amount * mu,
+        }
+    ).sort_values("Allocation %", ascending=False).reset_index(drop=True)
+    # The table lists every stock the selection stage chose — even ones the
+    # sizing stage then weighted to ~0% — so selection and table always agree.
+    chosen_set = {t for t, s in zip(tickers, res["selection"]) if s}
+    held_table = full_table[
+        full_table["Ticker"].isin(chosen_set)
+        | (full_table["Allocation %"] > DUST_WEIGHT * 100)
+    ]
+    pie_rows = full_table[full_table["Allocation %"] > DUST_WEIGHT * 100]
+
+    tab_alloc, tab_frontier, tab_explain = st.tabs(
+        ["📊 Allocation", "🌌 Efficient frontier", "🧠 What happened"]
     )
 
-    col_pie, col_table = st.columns([1, 1.3])
-    with col_pie:
-        held = [
-            (t, w * amount)
-            for t, w in zip(res["tickers"], weights)
-            if w > DUST_WEIGHT
-        ]
+    with tab_alloc:
+        col_pie, col_table = st.columns([1, 1.3])
+        with col_pie:
+            st.plotly_chart(
+                pie_fig(pie_rows["Ticker"].tolist(),
+                        pie_rows["Amount (EUR)"].tolist()),
+                width="stretch",
+            )
+        with col_table:
+            st.dataframe(
+                held_table,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Ticker": st.column_config.TextColumn("Ticker"),
+                    "Allocation %": st.column_config.NumberColumn(
+                        "Allocation %", format="%.2f %%"
+                    ),
+                    "Amount (EUR)": st.column_config.NumberColumn(
+                        "Amount to invest", format="€ %.2f"
+                    ),
+                    "Return contribution (pp)": st.column_config.NumberColumn(
+                        "Return contribution", format="%.2f pp",
+                        help="Percentage points of the portfolio's expected "
+                             "annual return contributed by this stock.",
+                    ),
+                    "Expected annual gain (EUR)": st.column_config.NumberColumn(
+                        "Expected gain / year", format="€ %.2f"
+                    ),
+                },
+            )
+        st.download_button(
+            "⬇️ Download full allocation as CSV (all tickers)",
+            full_table.to_csv(index=False).encode(),
+            file_name="quantum_portfolio_allocation.csv",
+            mime="text/csv",
+        )
+
+    with tab_frontier:
+        pool_idx = res["pool_indices"]
+        mu_pool = res["mu"][pool_idx]
+        sigma_pool = res["sigma"][np.ix_(pool_idx, pool_idx)]
+        st.caption(
+            f"{N_RANDOM_PORTFOLIOS:,} random portfolios built from the "
+            f"{len(pool_idx)} screened candidate stocks. Up and to the left is "
+            "better; the ⭐ marks your optimized portfolio."
+        )
         st.plotly_chart(
-            pie_fig([t for t, _ in held], [a for _, a in held]),
+            frontier_fig(mu_pool, sigma_pool, res["exp_return"],
+                         res["volatility"], res["seed"]),
             width="stretch",
         )
-    with col_table:
-        st.dataframe(
-            table,
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "Ticker": st.column_config.TextColumn("Ticker"),
-                "Allocation": st.column_config.NumberColumn(
-                    "Allocation %", format="%.1f %%"
-                ),
-                "Amount": st.column_config.NumberColumn(
-                    "Amount to invest", format="€ %.2f"
-                ),
-                "Expected return contribution": st.column_config.NumberColumn(
-                    "Return contribution",
-                    format="%.2f pp",
-                    help="Percentage points of the portfolio's expected annual "
-                         "return contributed by this stock (weight × its expected return).",
-                ),
-                "Expected annual gain": st.column_config.NumberColumn(
-                    "Expected gain / year", format="€ %.2f"
-                ),
-            },
-        )
 
-    # --- Efficient frontier ------------------------------------------------------
-    st.subheader("Efficient frontier")
-    st.caption(
-        f"{N_RANDOM_PORTFOLIOS:,} random portfolios built from your stocks. "
-        "Up and to the left is better; the ⭐ marks your optimized portfolio."
-    )
-    st.plotly_chart(
-        frontier_fig(
-            res["mu"], res["sigma"], res["exp_return"], res["volatility"], res["seed"]
-        ),
-        width="stretch",
-    )
+    with tab_explain:
+        render_explanation(res)
 
-    # --- Plain-language explanation ----------------------------------------------
-    n = len(res["tickers"])
-    # Use the solver's actual selection (not post-SLSQP weights) so the count
-    # always matches the budget the text mentions.
-    chosen = [t for t, s in zip(res["tickers"], res["selection"]) if s]
-    if res["method"] == "quantum":
-        step2 = (
-            f"**2.** A quantum algorithm called **QAOA** — simulated locally on your "
-            f"computer — used quantum superposition and interference to search among "
-            f"all **{2 ** n}** possible combinations of your stocks for the best "
-            f"balance of expected gain versus risk at your **{res['risk_label'].lower()}** "
-            f"risk setting. It decided that your money belongs in "
-            f"**{', '.join(chosen)}** ({res['budget']} of your {n} stocks)."
-        )
-    elif res["method"] == "classical":
-        step2 = (
-            f"**2.** The quantum step (QAOA) could not finish, so a regular computer "
-            f"solved the very same stock-picking problem exactly and chose "
-            f"**{', '.join(chosen)}**. That is why this result is labeled a "
-            f"*classical fallback* — the answer is valid, it just wasn't found by "
-            f"the quantum algorithm this time."
-        )
-    else:
-        step2 = (
-            "**2.** Both the quantum and the exact classical stock-picker failed, so "
-            "the app built the *safest possible mix* of all your stocks instead "
-            "(the classical minimum-variance portfolio)."
-        )
-    st.info(
-        f"""
-ℹ️ **What actually happened here, in plain language**
-
-**1.** The app downloaded one year of daily prices for your {n} stocks and measured
-how much each one tends to earn, how much it wobbles (risk), and how the stocks
-move together.
-
-{step2}
-
-**3.** A classical optimizer then split your **€{amount:,.2f}** among the chosen
-stocks using the same gain-versus-risk trade-off, giving the percentages above.
-
-Quantum computers don't make stocks more profitable — what they promise is speed:
-this kind of "pick the best combination" problem doubles in size with every stock
-you add, and that is exactly where quantum algorithms like QAOA are expected to
-shine as hardware matures. With {n} stocks a laptop can check every combination,
-so today this app is an honest, working demonstration of the technique.
-"""
-    )
     st.caption(
         "Data: Yahoo Finance via yfinance · Educational demo — not financial advice."
     )
 
+
+def render_explanation(res: dict) -> None:
+    n = len(res["tickers"])
+    pool_n = len(res["pool_indices"])
+    stats = res["stats"]
+    chosen = [t for t, s in zip(res["tickers"], res["selection"]) if s]
+    amount = res["amount"]
+
+    steps = [
+        f"**1. Measured the market.** Downloaded one year of daily prices for "
+        f"your {n} stocks and measured how much each tends to earn, how much it "
+        f"wobbles (risk), and how they move together."
+    ]
+    if res["screened"]:
+        steps.append(
+            f"**2. Screened the field.** A classical pre-screen ranked all {n} "
+            f"stocks by gain-versus-risk at your **{res['risk_label'].lower()}** "
+            f"risk setting and passed the best **{pool_n}** into the quantum round."
+        )
+    if res["method"] == "quantum":
+        steps.append(
+            f"**{len(steps) + 1}. Quantum tournament.** The QAOA quantum algorithm "
+            f"ran **{stats['subproblems']} subproblem(s)** of up to "
+            f"**{stats['max_chunk']} qubits** on the **{res['engine_label']}** — "
+            f"each one searching every combination of its group of stocks at once "
+            f"for the best gain-versus-risk balance. Winners advanced through "
+            f"{max(stats['rounds'], 1)} round(s) until exactly "
+            f"**{len(chosen)}** stocks remained: {_shortlist(chosen)}."
+        )
+    elif res["method"] == "classical":
+        steps.append(
+            f"**{len(steps) + 1}. Selection (classical fallback).** The quantum "
+            f"run could not finish ({res['fallback_reason']}), so a regular "
+            f"computer played the same tournament and chose {_shortlist(chosen)}. "
+            "The answer is valid — it just wasn't found by the quantum algorithm "
+            "this time."
+        )
+    else:
+        steps.append(
+            f"**{len(steps) + 1}. Selection failed entirely**, so the app built "
+            "the safest possible mix of the screened stocks instead (the "
+            "classical minimum-variance portfolio)."
+        )
+    steps.append(
+        f"**{len(steps) + 1}. Sized the positions.** A classical optimizer split "
+        f"your **€{amount:,.2f}** among the chosen stocks using the same "
+        "gain-versus-risk trade-off, giving the percentages in the Allocation tab."
+    )
+
+    st.info(
+        "ℹ️ **What actually happened here, in plain language**\n\n"
+        + "\n\n".join(steps)
+        + "\n\n---\n\nQuantum computers don't make stocks more profitable — "
+        "their promise is speed. 'Pick the best combination' problems double in "
+        "size with every stock you add, which is exactly where quantum "
+        "algorithms like QAOA are expected to shine as hardware matures. The "
+        "chunked tournament above is how today's limited qubit counts are "
+        "stretched to a 500-stock universe."
+    )
+
+
+# ==============================================================================
+# Main
+# ==============================================================================
 
 def main() -> None:
     st.set_page_config(
@@ -677,67 +538,64 @@ def main() -> None:
     )
     st.title("⚛️ Quantum Portfolio Optimizer")
     st.caption(
-        "Pick stocks with a quantum algorithm (QAOA) running on a local simulator — "
-        "no IBM account, no API keys."
+        "Portfolio selection with QAOA on real IBM Quantum hardware (or a local "
+        "simulator) — up to 500 stocks, hybrid quantum-classical pipeline."
     )
 
-    # --- Inputs -----------------------------------------------------------------
-    tickers_text = st.text_input(
-        "Stock tickers (comma-separated)",
-        value="AAPL, MSFT, NVDA, SAP.DE",
-        help=f"Yahoo Finance symbols, 2–{MAX_TICKERS} of them. "
-             "Non-US stocks need their exchange suffix, e.g. SAP.DE or AIR.PA.",
+    cfg = sidebar_config()
+
+    with st.expander("📋 How to use (quick guide)"):
+        st.markdown(
+            f"""
+1. **Pick the engine** in the sidebar — IBM Quantum hardware (needs a free API
+   key from [quantum.cloud.ibm.com](https://quantum.cloud.ibm.com)) or the
+   local simulator.
+2. **Enter tickers** below (comma, space or newline separated, 2–{MAX_TICKERS}).
+   Paste a whole index if you like.
+3. **Set the amount, risk tolerance and portfolio size**, then hit **Optimize**.
+4. Read the results in the three tabs — including an honest explanation of
+   what the quantum computer actually did.
+
+Full manual: [`docs/USAGE.md`](https://github.com/off-JnS/Quantum-Optimizing/blob/HEAD/docs/USAGE.md) ·
+Hosting guide: [`docs/DEPLOY_HOSTINGER.md`](https://github.com/off-JnS/Quantum-Optimizing/blob/HEAD/docs/DEPLOY_HOSTINGER.md)
+"""
+        )
+
+    st.subheader("1️⃣ Stocks")
+    tickers_text = st.text_area(
+        "Ticker symbols (comma, space or newline separated)",
+        value=DEFAULT_TICKERS,
+        height=110,
+        help=f"Yahoo Finance symbols, 2–{MAX_TICKERS}. Non-US stocks need their "
+             "exchange suffix, e.g. SAP.DE or AIR.PA.",
     )
-    col_amount, col_risk = st.columns(2)
+    tickers = parse_tickers(tickers_text)
+    st.caption(f"**{len(tickers)}** tickers recognized (maximum {MAX_TICKERS}).")
+
+    st.subheader("2️⃣ Investment")
+    col_amount, col_risk, col_budget = st.columns(3)
     with col_amount:
         amount = st.number_input(
             "Total investment (€)", min_value=100.0, value=10_000.0, step=500.0
         )
     with col_risk:
         risk_label = st.select_slider(
-            "Risk tolerance",
-            options=list(RISK_MAP),
-            value="Medium",
+            "Risk tolerance", options=list(RISK_MAP), value="Medium",
             help="Low = prefer steadier stocks even if they earn less. "
                  "High = chase return, accept bigger swings.",
         )
-
-    tickers = parse_tickers(tickers_text)
-    n = len(tickers)
-
-    # --- Advanced settings ---------------------------------------------------------
-    with st.expander("⚙️ Advanced settings"):
-        if 2 <= n <= MAX_TICKERS:
-            budget = st.slider(
-                "Number of stocks to hold (quantum selection budget)",
-                min_value=1,
-                max_value=n,
-                value=min(n, max(2, n // 2)),
-                key=f"budget_{n}",  # re-keyed so the range follows the ticker list
-                help="QAOA picks exactly this many of your tickers to invest in.",
-            )
-        else:
-            budget = None
-        c1, c2 = st.columns(2)
-        with c1:
-            reps = st.slider("QAOA circuit depth (reps)", 1, 4, 2)
-            shots = st.select_slider(
-                "Simulator shots", options=[256, 512, 1024, 2048, 4096], value=1024
-            )
-            seed = int(st.number_input("Random seed", min_value=0, value=SEED, step=1))
-        with c2:
-            maxiter = st.slider("Classical optimizer iterations (COBYLA)", 25, 300, 150, step=25)
-            timeout_s = st.slider(
-                "QAOA time budget before classical fallback (seconds)",
-                10, 300, QAOA_TIMEOUT_S, step=10,
-            )
-
-    # --- Action ----------------------------------------------------------------
-    if st.button("🚀 Optimize", type="primary", width="stretch"):
-        run_pipeline(
-            tickers, amount, risk_label, budget,
-            reps, shots, maxiter, timeout_s, seed,
+    with col_budget:
+        budget_max = max(2, min(40, len(tickers))) if tickers else 2
+        budget = st.slider(
+            "Number of stocks to hold", 1, budget_max,
+            min(10, max(2, budget_max // 2)),
+            key=f"budget_{budget_max}",
+            help="The quantum tournament selects exactly this many stocks.",
         )
+
+    st.subheader("3️⃣ Optimize")
+    if st.button("🚀 Optimize", type="primary", width="stretch"):
+        run_pipeline(tickers, amount, risk_label, budget, cfg)
 
     # Results live in session_state so they survive Streamlit's reruns
     # (slider wiggles, window resizes, …) until the next optimization.

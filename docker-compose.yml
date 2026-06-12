@@ -1,0 +1,36 @@
+# One-command deployment: `docker compose up -d`
+#
+# Environment variables (set them in hPanel's Docker Manager or in a `.env`
+# file next to this compose file):
+#   IBM_QUANTUM_TOKEN  - your IBM Quantum API key (optional; the app falls
+#                        back to the local simulator without it)
+#   DOMAIN             - your domain, e.g. quantum.example.com -> automatic
+#                        HTTPS via Caddy/Let's Encrypt. Leave unset to serve
+#                        plain HTTP on port 80 (reachable via the VPS IP).
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      - IBM_QUANTUM_TOKEN=${IBM_QUANTUM_TOKEN:-}
+    expose:
+      - "8501"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:-:80}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  caddy_data:
+  caddy_config:

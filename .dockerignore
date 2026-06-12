@@ -1,0 +1,10 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+docs
+README.md
+.streamlit/secrets.toml
+.gitignore
+.dockerignore
