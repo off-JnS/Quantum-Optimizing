@@ -36,6 +36,7 @@ explains every step in plain language.
 │   └── optimizer.py            #   screening, QAOA tournament, fallbacks, weighting
 ├── scripts/smoke_test.py       # 17 headless checks (run after install)
 ├── docs/
+│   ├── IBM_SETUP.md            # 🔌 run every calculation on a real IBM quantum computer
 │   ├── USAGE.md                # 📖 full manual: every control, IBM setup, scaling
 │   └── DEPLOY_HOSTINGER.md     # 🚀 host it 24/7 on a Hostinger VPS from GitHub
 ├── LOCAL_SETUP.md              # local runs + free hosting alternatives (ngrok, Streamlit Cloud)
@@ -70,16 +71,24 @@ More local options (LAN sharing, ngrok, free cloud hosts): [LOCAL_SETUP.md](LOCA
 
 ## Using IBM Quantum hardware
 
-1. Create a free account at [quantum.cloud.ibm.com](https://quantum.cloud.ibm.com)
-   and generate an **API key**.
-2. Paste it in the app's sidebar — or set `IBM_QUANTUM_TOKEN` in the
-   environment (the right way on a server).
-3. Pick *IBM Quantum hardware* in the sidebar and optimize. The app chooses
-   the least busy device automatically and falls back to the local simulator
-   (with a visible warning) if IBM is unreachable.
+**👉 Full step-by-step walkthrough: [docs/IBM_SETUP.md](docs/IBM_SETUP.md)** —
+account creation, finding your API key + instance CRN, the three ways to supply
+credentials, and forcing every calculation onto the quantum computer.
 
-⏱️ The free Open plan includes ~10 minutes of QPU time per month and public
-devices queue — see [docs/USAGE.md](docs/USAGE.md) for quota-friendly settings.
+In short:
+
+1. Create a free account at [quantum.cloud.ibm.com](https://quantum.cloud.ibm.com),
+   then copy your **API key** (Home dashboard) and **instance CRN** (Instances page).
+2. Supply them via the sidebar, a `.env` file (`IBM_QUANTUM_TOKEN` /
+   `IBM_QUANTUM_INSTANCE`), or `QiskitRuntimeService.save_account(...)`.
+3. Pick *IBM Quantum hardware* in the sidebar, click **🔌 Test IBM connection**
+   to verify (uses no quota), then optimize. To run **100% on hardware**,
+   uncheck the local-simulator fallback.
+
+⏱️ The free Open plan includes ~10 minutes of QPU time per 28-day window and
+public devices queue, and **each optimizer iteration is a separate job** — so
+for an all-hardware run keep the universe small (4–8 tickers, low iterations).
+See [docs/IBM_SETUP.md](docs/IBM_SETUP.md) for the recommended settings.
 
 ## How it scales to 500 stocks
 

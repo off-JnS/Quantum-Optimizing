@@ -41,6 +41,8 @@ from quantum_portfolio.data import (
 from quantum_portfolio.engines import (
     build_ibm_engine,
     build_local_engine,
+    ibm_connection_report,
+    resolve_ibm_instance,
     resolve_ibm_token,
 )
 from quantum_portfolio.optimizer import (
@@ -167,13 +169,17 @@ def sidebar_config() -> dict:
                  "variable instead of pasting it here.",
         )
         if not resolve_ibm_token(token):
-            st.sidebar.warning(
-                "No API key yet — paste one above or set IBM_QUANTUM_TOKEN. "
-                "Until then, runs fall back to the local simulator."
+            st.sidebar.info(
+                "No API key in this field. The app will try a saved account "
+                "(QiskitRuntimeService.save_account) or IBM_QUANTUM_TOKEN; if "
+                "none exists, runs fall back to the local simulator."
             )
         instance = st.sidebar.text_input(
-            "Instance CRN (optional)",
-            help="Leave empty to use your account's default instance.",
+            "Instance CRN (recommended)",
+            value=os.environ.get("IBM_QUANTUM_INSTANCE", ""),
+            help="Copy it from the Instances page at quantum.cloud.ibm.com. "
+                 "Leave empty only if your account has a single default "
+                 "instance. Can be preset via IBM_QUANTUM_INSTANCE.",
         )
         backend_name = st.sidebar.text_input(
             "Backend name (optional)",
@@ -182,13 +188,36 @@ def sidebar_config() -> dict:
                  "busy device. Can also be preset via the IBM_QUANTUM_BACKEND "
                  "environment variable.",
         )
+        # Verify credentials WITHOUT running a job (and so without spending quota).
+        if st.sidebar.button("🔌 Test IBM connection"):
+            try:
+                with st.spinner("Connecting to IBM Quantum…"):
+                    report = ibm_connection_report(
+                        resolve_ibm_token(token), resolve_ibm_instance(instance)
+                    )
+                st.sidebar.success(
+                    f"Connected — {len(report)} backend(s) available."
+                )
+                st.sidebar.dataframe(
+                    report, hide_index=True,
+                    column_config={
+                        "name": "Backend", "qubits": "Qubits",
+                        "pending_jobs": "Queue", "simulator": "Sim",
+                    },
+                )
+            except Exception as exc:
+                st.sidebar.error(str(exc))
         allow_fallback = st.sidebar.checkbox(
-            "Fall back to the local simulator if IBM is unavailable", value=True
+            "Fall back to the local simulator if IBM is unavailable", value=True,
+            help="Uncheck this to force every calculation onto IBM hardware "
+                 "(the run will error instead of computing locally).",
         )
         st.sidebar.caption(
             "💡 Hardware runs queue behind other users and consume your IBM "
-            "quota (the free Open plan includes ~10 min of QPU time per month), "
-            "so the defaults below are deliberately frugal."
+            "quota (the free Open plan gives ~10 min of QPU time per 28 days). "
+            "Each optimizer iteration is a separate job, so for an all-hardware "
+            "run keep the **universe ≤ the chunk size** (one QAOA optimization) "
+            "and the iterations low. Full setup: docs/IBM_SETUP.md."
         )
 
     with st.sidebar.expander("🔬 Algorithm settings"):
@@ -247,7 +276,7 @@ def build_engine(cfg: dict):
     try:
         return build_ibm_engine(
             resolve_ibm_token(cfg["token"]),
-            cfg["instance"],
+            resolve_ibm_instance(cfg["instance"]),
             cfg["backend_name"],
             cfg["shots"],
             min_qubits=cfg["chunk_size"],

@@ -217,19 +217,33 @@ def test_weights():
     assert abs(mv.sum() - 1.0) < 1e-6 and (mv >= -1e-9).all()
 
 
-def test_ibm_engine_errors_cleanly_without_token():
-    os.environ.pop("IBM_QUANTUM_TOKEN", None)
+def test_ibm_token_and_instance_resolution():
+    for var in ("IBM_QUANTUM_TOKEN", "IBM_QUANTUM_INSTANCE"):
+        os.environ.pop(var, None)
     assert engines.resolve_ibm_token("") is None
     assert engines.resolve_ibm_token("  abc  ") == "abc"
+    assert engines.resolve_ibm_instance("  crn:x  ") == "crn:x"
     os.environ["IBM_QUANTUM_TOKEN"] = "from-env"
+    os.environ["IBM_QUANTUM_INSTANCE"] = "crn-from-env"
     assert engines.resolve_ibm_token(None) == "from-env"
-    os.environ.pop("IBM_QUANTUM_TOKEN", None)
-    try:
-        engines.build_ibm_engine(None, None, None, shots=1024, min_qubits=8)
-    except ValueError as exc:
-        assert "API key" in str(exc)
-        return
-    raise AssertionError("expected ValueError without a token")
+    assert engines.resolve_ibm_instance(None) == "crn-from-env"
+    for var in ("IBM_QUANTUM_TOKEN", "IBM_QUANTUM_INSTANCE"):
+        os.environ.pop(var, None)
+
+
+def test_ibm_engine_errors_cleanly_without_token():
+    # No token and (in this sandbox) no saved account -> friendly ValueError,
+    # never a raw qiskit exception, and never a silent hang.
+    for fn in (
+        lambda: engines.build_ibm_engine(None, None, None, shots=1024, min_qubits=8),
+        lambda: engines.ibm_connection_report(None, None),
+    ):
+        try:
+            fn()
+        except ValueError as exc:
+            assert "IBM Quantum" in str(exc)
+        else:
+            raise AssertionError("expected ValueError without credentials")
 
 
 def test_random_portfolios():
@@ -270,6 +284,7 @@ if __name__ == "__main__":
     check("optimize_portfolio: quantum tournament (40 stocks)", test_optimize_portfolio_quantum_tournament)
     check("timeout -> classical fallback", test_timeout_falls_back_to_classical)
     check("SLSQP & min-variance weights", test_weights)
+    check("IBM token/instance resolution", test_ibm_token_and_instance_resolution)
     check("IBM engine: clean errors without token", test_ibm_engine_errors_cleanly_without_token)
     check("random portfolio cloud", test_random_portfolios)
     check("live yfinance fetch (optional)", test_live_yfinance_optional)
